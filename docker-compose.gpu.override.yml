@@ -1,0 +1,12 @@
+# NVIDIA GPU override (Linux host + nvidia-container-toolkit, or Docker Desktop WSL2 GPU).
+# Usage: docker compose -f docker-compose.yml -f docker-compose.gpu.override.yml up -d
+# Verify: docker compose exec ollama nvidia-smi
+services:
+  ollama:
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]

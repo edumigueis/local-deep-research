@@ -1,0 +1,161 @@
+# ============================================================================
+# Local Deep Research + SearXNG + Ollama  (private AI research assistant)
+# Based on the official LearningCircuit/local-deep-research compose file.
+#
+#   Core stack : docker compose up -d
+#   + HTTPS    : docker compose --profile proxy up -d      (Caddy reverse proxy)
+#   + NVIDIA   : docker compose -f docker-compose.yml -f docker-compose.gpu.override.yml up -d
+#
+# Everything is configured through .env (copy .env.example -> .env).
+# Use ./deploy.sh instead of calling compose by hand.
+# ============================================================================
+
+services:
+  local-deep-research:
+    image: localdeepresearch/local-deep-research:${LDR_IMAGE_TAG:-latest}
+    container_name: ldr_app
+    stop_grace_period: 60s
+    networks:
+      ldr-network:
+    ports:
+      # Bound to loopback by default. Set LDR_BIND_ADDR=0.0.0.0 only for LAN tests
+      # without the proxy profile.
+      - "${LDR_BIND_ADDR:-127.0.0.1}:5000:5000"
+    environment:
+      # --- Docker-specific (forced upstream, do not change) ---
+      - LDR_WEB_HOST=0.0.0.0
+      - LDR_WEB_PORT=5000
+      - LDR_DATA_DIR=/data
+      # --- Service endpoints on the private network ---
+      # Env-locking the SearXNG URL also marks it operator-approved (v1.10.3+).
+      - LDR_LLM_OLLAMA_URL=http://ollama:11434
+      - LDR_SEARCH_ENGINE_WEB_SEARXNG_DEFAULT_PARAMS_INSTANCE_URL=http://searxng:8080
+      # --- LLM selection (env vars LOCK the setting in the UI) ---
+      - LDR_LLM_PROVIDER=ollama
+      - LDR_LLM_MODEL=${LDR_LLM_MODEL:-gemma3:4b}
+      # --- Hardening: flip to false AFTER creating the admin account ---
+      - LDR_APP_ALLOW_REGISTRATIONS=${LDR_APP_ALLOW_REGISTRATIONS:-true}
+      # --- Reverse proxy trust (only meaningful with the 'proxy' profile) ---
+      # Caddy has a fixed IP on ldr-network so the allow-list is deterministic.
+      - TRUST_PROXY_HEADERS=${TRUST_PROXY_HEADERS:-false}
+      - LDR_SERVER_FORWARDED_ALLOW_IPS=172.28.0.10
+    volumes:
+      - ldr_data:/data
+      - ldr_scripts:/scripts
+    ulimits:
+      memlock:
+        soft: -1
+        hard: -1
+    security_opt:
+      - "no-new-privileges:true"
+    cap_drop:
+      - ALL
+    cap_add:            # needed only by the entrypoint's root phase, then dropped
+      - CHOWN
+      - FOWNER
+      - DAC_OVERRIDE
+      - SETUID
+      - SETGID
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:5000/auth/login', timeout=5).status == 200 else 1)"]
+      interval: 15s
+      timeout: 10s
+      start_period: 60s
+      retries: 5
+    restart: unless-stopped
+    depends_on:
+      ollama:
+        condition: service_healthy
+      searxng:
+        condition: service_healthy
+
+  ollama:
+    image: ollama/ollama:latest@sha256:8850b8b33936b9fb246e7b3e02849941f1151ea847e5fb15511f17de9589aea1
+    container_name: ollama_service
+    environment:
+      OLLAMA_KEEP_ALIVE: "30m"
+      # Concurrent requests served per loaded model. Raise to 4-5 in production
+      # (costs extra VRAM for KV-cache). 1 is right for a laptop.
+      OLLAMA_NUM_PARALLEL: "${OLLAMA_NUM_PARALLEL:-1}"
+    volumes:
+      - ollama_data:/root/.ollama
+    networks:
+      ldr-network:
+    # NO published ports: Ollama has no authentication. Internal only.
+    security_opt:
+      - "no-new-privileges:true"
+    cap_drop:
+      - ALL
+    healthcheck:
+      test: ["CMD", "ollama", "list"]
+      interval: 10s
+      timeout: 5s
+      start_period: 30s
+      retries: 5
+    restart: unless-stopped
+
+  searxng:
+    image: searxng/searxng:latest@sha256:6dd0dffc05a75d92bbacd858953b4e93b8f709403c3fb1fb8a33ca8fd02e40a4
+    container_name: searxng
+    volumes:
+      - searxng_data:/etc/searxng
+    networks:
+      ldr-network:
+    # NO published ports: reachable only by LDR on ldr-network.
+    security_opt:
+      - "no-new-privileges:true"
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:8080/healthz"]
+      interval: 30s
+      timeout: 10s
+      start_period: 30s
+      retries: 3
+    restart: unless-stopped
+
+  # ---------------------------------------------------------------------------
+  # Optional reverse proxy: automatic HTTPS (Let's Encrypt for a real domain,
+  # Caddy's internal CA for 'localhost'). Enabled with: --profile proxy
+  # ---------------------------------------------------------------------------
+  caddy:
+    image: caddy:2-alpine
+    container_name: ldr_caddy
+    profiles: ["proxy"]
+    environment:
+      - LDR_DOMAIN=${LDR_DOMAIN:-localhost}
+      - ACME_EMAIL=${ACME_EMAIL:-admin@example.com}
+    ports:
+      - "80:80"
+      - "443:443"
+      - "443:443/udp"   # HTTP/3
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    networks:
+      ldr-network:
+        ipv4_address: 172.28.0.10
+    security_opt:
+      - "no-new-privileges:true"
+    cap_drop:
+      - ALL
+    cap_add:
+      - NET_BIND_SERVICE
+    depends_on:
+      local-deep-research:
+        condition: service_healthy
+    restart: unless-stopped
+
+volumes:
+  ldr_data:
+  ldr_scripts:
+  searxng_data:
+  ollama_data:
+  caddy_data:      # only used by the proxy profile (TLS certs)
+  caddy_config:
+
+networks:
+  ldr-network:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.28.0.0/24

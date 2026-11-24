@@ -1,0 +1,25 @@
+{
+	email {$ACME_EMAIL}
+}
+
+{$LDR_DOMAIN:localhost} {
+	encode zstd gzip
+
+	header {
+		Strict-Transport-Security "max-age=31536000"
+		X-Content-Type-Options "nosniff"
+		Referrer-Policy "no-referrer"
+		-Server
+	}
+
+	reverse_proxy local-deep-research:5000 {
+		# Research progress streams over long-lived connections.
+		flush_interval -1
+		transport http {
+			read_timeout 30m
+		}
+		# Caddy overwrites (not appends) these for untrusted clients.
+		header_up X-Real-IP {remote_host}
+		header_up X-Forwarded-For {remote_host}
+	}
+}
