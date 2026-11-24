@@ -33,6 +33,9 @@ services:
       # --- LLM selection (env vars LOCK the setting in the UI) ---
       - LDR_LLM_PROVIDER=ollama
       - LDR_LLM_MODEL=${LDR_LLM_MODEL:-gemma3:4b}
+      # Gemma 3 does not support "thinking" (HTTP 400). Keep false for gemma3,
+      # set true for reasoning models (qwen3, deepseek-r1) in production.
+      - LDR_LLM_OLLAMA_ENABLE_THINKING=${LDR_LLM_OLLAMA_ENABLE_THINKING:-false}
       # --- Hardening: flip to false AFTER creating the admin account ---
       - LDR_APP_ALLOW_REGISTRATIONS=${LDR_APP_ALLOW_REGISTRATIONS:-true}
       # --- Reverse proxy trust (only meaningful with the 'proxy' profile) ---
