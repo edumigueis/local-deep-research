@@ -1,2 +1,4 @@
 .env
 metrics/
+.cloud/
+.test-account

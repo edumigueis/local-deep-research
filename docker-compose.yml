@@ -36,6 +36,9 @@ services:
       # Gemma 3 does not support "thinking" (HTTP 400). Keep false for gemma3,
       # set true for reasoning models (qwen3, deepseek-r1) in production.
       - LDR_LLM_OLLAMA_ENABLE_THINKING=${LDR_LLM_OLLAMA_ENABLE_THINKING:-false}
+      # Upstream default 'langgraph-agent' needs native tool calling (gemma3 has
+      # none -> research fails with 0 sources). 'source-based' works with any model.
+      - LDR_SEARCH_SEARCH_STRATEGY=${LDR_SEARCH_STRATEGY:-source-based}
       # --- Hardening: flip to false AFTER creating the admin account ---
       - LDR_APP_ALLOW_REGISTRATIONS=${LDR_APP_ALLOW_REGISTRATIONS:-true}
       # --- Reverse proxy trust (only meaningful with the 'proxy' profile) ---

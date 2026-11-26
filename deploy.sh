@@ -69,6 +69,30 @@ wait_healthy() { # wait_healthy <container> <timeout_s>
   err "$c not healthy after ${t}s (last state: $s). Try: docker logs $c"; return 1
 }
 
+searxng_configure() {
+  # Patch the settings.yml SearXNG generates on first start (in the searxng_data
+  # volume). Idempotent. Paths live inside `sh -c` so Git Bash does not rewrite them.
+  #  1. LDR queries SearXNG with format=json, disabled by default (HTTP 403 ->
+  #     every research ends with zero sources).
+  #  2. The default web engines (DuckDuckGo, Startpage, Brave) answer automated
+  #     traffic with CAPTCHAs / rate limits, and Bing's scraper returns unrelated
+  #     pages. Yandex and Seznam return relevant results but ship disabled.
+  local f=/etc/searxng/settings.yml changed=false e
+  if ! docker exec searxng sh -c "grep -q '^    - json\$' $f"; then
+    log "SearXNG: enabling JSON output format"
+    docker exec searxng sh -c "sed -i '/^  formats:\$/,/^\$/ s/^    - html\$/    - html\n    - json/' $f"
+    changed=true
+  fi
+  for e in ${SEARXNG_EXTRA_ENGINES:-yandex seznam}; do
+    if docker exec searxng sh -c "sed -n '/^  - name: $e\$/,/^\$/p' $f | grep -q 'disabled: true'"; then
+      log "SearXNG: enabling the $e engine"
+      docker exec searxng sh -c "sed -i '/^  - name: $e\$/,/^\$/ {/^    disabled: true\$/d}' $f"
+      changed=true
+    fi
+  done
+  if $changed; then docker restart searxng >/dev/null; wait_healthy searxng 120; fi
+}
+
 pull_model() {
   local m; m="$(get_env LDR_LLM_MODEL)"
   log "Pulling model '$m' into Ollama (cached in the ollama_data volume)..."
@@ -82,6 +106,7 @@ cmd_up() {
   "${COMPOSE[@]}" "${PROFILE_ARGS[@]}" up -d ollama searxng
   wait_healthy ollama_service 120
   wait_healthy searxng 120
+  searxng_configure
   pull_model
   "${COMPOSE[@]}" "${PROFILE_ARGS[@]}" up -d
   wait_healthy ldr_app 180
