@@ -14,7 +14,8 @@
 # Cost guards: the instance terminates itself after MAX_HOURS (shutdown -h in
 # user-data + instance-initiated-shutdown-behavior=terminate); `up` refuses to
 # start if spend so far + MAX_HOURS at the hourly price would pass BUDGET_USD.
-# Without GPU quota (G and VT vCPUs = 0) it falls back to a CPU instance.
+# Without GPU quota (G and VT vCPUs = 0) it falls back to a CPU instance, and on
+# an AWS Free plan account to the largest free-tier-eligible type.
 set -euo pipefail
 cd "$(dirname "$0")"
 export MSYS_NO_PATHCONV=1          # Git Bash: do not rewrite /paths in aws args
@@ -23,7 +24,10 @@ REGION="${REGION:-us-east-2}"       # only region allowed by the account's SCP
 NAME="${NAME:-ldr-test}"
 BUDGET_USD="${BUDGET_USD:-10}"
 MAX_HOURS="${MAX_HOURS:-2}"
-DISK_GB="${DISK_GB:-40}"
+DISK_GB="${DISK_GB:-30}"            # 30 GB = EBS free-tier allowance; stack needs ~18 GB
+# Accounts on the AWS Free plan may only launch free-tier-eligible types; the
+# biggest one (2 vCPU, 8 GiB) still runs qwen2.5:3b on CPU.
+FREE_TIER_TYPE="${FREE_TIER_TYPE:-m7i-flex.large}"
 REPO_URL="${REPO_URL:-https://github.com/edumigueis/local-deep-research.git}"
 BRANCH="${BRANCH:-main}"
 QUERY="${QUERY:-What are the main differences between IaaS, PaaS and SaaS in cloud computing?}"
@@ -32,7 +36,7 @@ STATE_DIR=".cloud"; STATE="$STATE_DIR/state"; COST_LOG="results/cost-log.csv"
 KEY_FILE="$HOME/.ssh/${NAME}-key.pem"   # outside OneDrive so chmod 600 sticks
 
 # On-demand Linux prices, us-east-2 (USD/hour) and gp3 storage (USD/GB-month).
-price() { case "$1" in t3.xlarge) echo 0.1664;; t3.2xlarge) echo 0.3328;; g4dn.xlarge) echo 0.526;; g5.xlarge) echo 1.006;; *) echo "";; esac; }
+price() { case "$1" in m7i-flex.large) echo 0.0958;; c7i-flex.large) echo 0.0848;; t3.xlarge) echo 0.1664;; t3.2xlarge) echo 0.3328;; g4dn.xlarge) echo 0.526;; g5.xlarge) echo 1.006;; *) echo "";; esac; }
 GP3_GB_MONTH=0.08
 
 log() { printf '\033[1;35m[cloud]\033[0m %s\n' "$*"; }
@@ -101,38 +105,44 @@ git clone --depth 1 -b ${BRANCH} ${REPO_URL} /opt/ldr
 cd /opt/ldr
 cp .env.example .env
 sed -i 's/^LDR_LLM_MODEL=.*/LDR_LLM_MODEL=${MODEL}/' .env
-./deploy.sh up ${gpuflag}
+bash deploy.sh up ${gpuflag}
 date +%s > /var/lib/ldr-ready
 EOF
+}
+
+launch() {
+  aws_ ec2 run-instances --image-id "$AMI" --instance-type "$ITYPE"     --key-name "$NAME-key" --security-group-ids "$SG"     --instance-initiated-shutdown-behavior terminate     --metadata-options HttpTokens=required     --block-device-mappings "[{\"DeviceName\":\"/dev/sda1\",\"Ebs\":{\"VolumeSize\":$DISK_GB,\"VolumeType\":\"gp3\",\"DeleteOnTermination\":true}}]"     --user-data "file://$STATE_DIR/user-data.sh"     --tag-specifications "ResourceType=instance,Tags=[{Key=Name,Value=$NAME},{Key=Project,Value=ldr}]"     --query 'Instances[0].InstanceId' --output text
 }
 
 cmd_up() {
   [[ -n "$(load INSTANCE_ID)" ]] && { err "instance $(load INSTANCE_ID) already in state; run ./cloud.sh down first"; exit 1; }
   pick_instance; budget_check
-  local myip ami sg iid
+  local myip iid
   myip="$(curl -fsS https://checkip.amazonaws.com | tr -d '[:space:]')"
-  ami="$(find_ami)"; [[ "$ami" == ami-* ]] || { err "AMI not found"; exit 1; }
-  log "Region $REGION | $ITYPE | model $MODEL | AMI $ami | SSH allowed from $myip/32"
+  AMI="$(find_ami)"; [[ "$AMI" == ami-* ]] || { err "AMI not found"; exit 1; }
+  log "Region $REGION | $ITYPE | model $MODEL | AMI $AMI | SSH allowed from $myip/32"
 
   mkdir -p "$(dirname "$KEY_FILE")"; rm -f "$KEY_FILE"
   aws_ ec2 create-key-pair --key-name "$NAME-key" --key-type ed25519 \
-    --query KeyMaterial --output text > "$KEY_FILE"
+    --query KeyMaterial --output text | tr -d '\r' > "$KEY_FILE"   # Windows CLI writes CRLF
   chmod 600 "$KEY_FILE"; save KEY_NAME "$NAME-key"
 
-  sg="$(aws_ ec2 create-security-group --group-name "$NAME-sg" \
+  SG="$(aws_ ec2 create-security-group --group-name "$NAME-sg" \
         --description "LDR test: SSH from operator IP only" --query GroupId --output text)"
-  save SG_ID "$sg"
-  aws_ ec2 authorize-security-group-ingress --group-id "$sg" --protocol tcp --port 22 --cidr "$myip/32" >/dev/null
+  save SG_ID "$SG"
+  aws_ ec2 authorize-security-group-ingress --group-id "$SG" --protocol tcp --port 22 --cidr "$myip/32" >/dev/null
 
   mkdir -p "$STATE_DIR"; user_data > "$STATE_DIR/user-data.sh"
-  iid="$(aws_ ec2 run-instances --image-id "$ami" --instance-type "$ITYPE" \
-        --key-name "$NAME-key" --security-group-ids "$sg" \
-        --instance-initiated-shutdown-behavior terminate \
-        --metadata-options HttpTokens=required \
-        --block-device-mappings "[{\"DeviceName\":\"/dev/sda1\",\"Ebs\":{\"VolumeSize\":$DISK_GB,\"VolumeType\":\"gp3\",\"DeleteOnTermination\":true}}]" \
-        --user-data "file://$STATE_DIR/user-data.sh" \
-        --tag-specifications "ResourceType=instance,Tags=[{Key=Name,Value=$NAME},{Key=Project,Value=ldr}]" \
-        --query 'Instances[0].InstanceId' --output text)"
+  local out
+  if ! out="$(launch 2>&1)"; then
+    if [[ "$out" == *"not eligible for Free Tier"* && "$ITYPE" != "$FREE_TIER_TYPE" ]]; then
+      log "Account is on the AWS Free plan: $ITYPE refused -> $FREE_TIER_TYPE"
+      ITYPE="$FREE_TIER_TYPE"; GPU=false; MODEL=qwen2.5:3b; budget_check
+      AMI="$(find_ami)"; user_data > "$STATE_DIR/user-data.sh"
+      out="$(launch 2>&1)" || { err "$out"; exit 1; }
+    else err "$out"; exit 1; fi
+  fi
+  iid="$out"
   save INSTANCE_ID "$iid"; save ITYPE "$ITYPE"; save MODEL "$MODEL"; save LAUNCHED "$(date +%s)"
   log "Launched $iid, waiting for 'running'..."
   aws_ ec2 wait instance-running --instance-ids "$iid"
@@ -149,7 +159,7 @@ wait_ready() {
   log "Waiting for the stack on the instance (deploy.sh up)..."
   until ssh_ 'test -f /var/lib/ldr-ready' 2>/dev/null; do
     (( SECONDS - t0 > 1800 )) && { err "not ready after 30 min"; ssh_ 'sudo tail -n 40 /var/log/ldr-bootstrap.log' || true; return 1; }
-    if ssh_ 'cloud-init status' 2>/dev/null | grep -q error; then
+    if ssh_ 'cloud-init status || true' 2>/dev/null | grep -q error; then
       err "cloud-init failed"; ssh_ 'sudo tail -n 40 /var/log/ldr-bootstrap.log' || true; return 1
     fi
     sleep 20
@@ -194,7 +204,7 @@ cmd_down() {
     echo "$(date +%F),$iid,$it,$REGION,$hours,$(price "$it"),$cost" >> "$COST_LOG"
     log "Ran ${hours} h -> est. \$$cost (total so far \$$(spent_so_far))"
   fi
-  [[ -n "$sg" ]] && { aws_ ec2 delete-security-group --group-id "$sg" && log "Deleted SG $sg" || err "could not delete SG $sg"; }
+  [[ -n "$sg" ]] && { aws_ ec2 delete-security-group --group-id "$sg" >/dev/null && log "Deleted SG $sg" || err "could not delete SG $sg"; }
   [[ -n "$key" ]] && { aws_ ec2 delete-key-pair --key-name "$key" >/dev/null && log "Deleted key pair $key"; rm -f "$KEY_FILE"; }
   rm -f "$STATE"
 }
